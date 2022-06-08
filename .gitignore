@@ -1,0 +1,13 @@
+.terraform
+.terraform.lock.hcl
+__pycache__
+appsettings.local.json
+appsettings.development.json
+dockercmd.sh
+setlocalenv.sh
+locals.txt
+**/.DS_Store
+.vscode
+.tfstate
+.vs
+src/testing/loadtest-azure/scripts/accesstoken.txt
