@@ -1,0 +1,96 @@
+parameters:
+  chartName: '' # chart name e.g. catalogservice (foldername in workingDirectory)
+  workingDirectory: 'src/app/charts'
+  jobName: '' # name for each build job - needs to be unique within a given stage/pipeline
+
+jobs:
+- job: 'helm_${{ parameters.jobName }}'
+  displayName: 'Package helm chart ${{ parameters.jobName }}'
+  steps:
+
+  - download: current # download pipeline artifacts
+
+  - template: steps-buildagent-prerequisites.yaml
+
+  - template: steps-parse-terraform-output.yaml # parse global configuration settings from terraform deployment output
+    parameters:
+      workingDirectory: '$(Pipeline.Workspace)/terraformOutputGlobalInfra'  # Global infra deploy output directory
+
+  - task: PowerShell@2
+    displayName: 'Validate helm chart'
+    continueOnError: true    # We just want this to show as a warning in ADO, not a pipeline failure
+    inputs:
+      workingDirectory: ${{ parameters.workingDirectory }}
+      targetType: inline
+      script: |
+
+        # check if chartname (equals directory name) exists in working directory
+        if ((Test-Path "${{ parameters.chartName}}") -ne $true) {
+          throw "*** Error - ${{ parameters.chartName }} does not exist in ${{ parameters.workingDirectory }}"
+        }
+
+        # download kubeaudit
+        Invoke-WebRequest https://github.com/Shopify/kubeaudit/releases/download/0.17.0/kubeaudit_0.17.0_linux_amd64.tar.gz -outfile kubeaudit.tar.gz
+        tar xvzf kubeaudit.tar.gz 
+
+        # generate yaml manifest 
+        helm template ${{ parameters.chartName }} > "${{ parameters.chartName}}.temp.yaml"
+
+        # run kubeaudit against the yaml manifest generated out of this helm chart
+        ./kubeaudit all -f "${{ parameters.chartName}}.temp.yaml"
+
+
+  - task: AzureCLI@2
+    displayName: 'Helm package and push ${{ parameters.chartName }}'
+    retryCountOnTaskFailure: 1
+    inputs:
+      azureSubscription: $(azureServiceConnection)
+      workingDirectory: ${{ parameters.workingDirectory }}
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+
+        echo "*** Retrieved Azure Container Registry Login Server $(acr_login_server) from Terraform deployment output"
+
+        #echo "*** DEBUG: Entering Working Directory: ${{ parameters.workingDirectory }}"
+        #cd ${{ parameters.workingDirectory }}
+
+        helm lint ${{ parameters.chartName}} # lint helm chart
+
+        # Login to ACR so we can later push to it
+        $USERNAME="00000000-0000-0000-0000-000000000000"
+        $PASSWORD=az acr login -n $(acr_name) --expose-token --output tsv --query accessToken
+        helm registry login $(acr_name).azurecr.io --username $USERNAME --password $PASSWORD
+
+        if ($LastExitCode -ne 0) {
+          throw "*** Error - could not log in to ACR $(acr_name)"
+        }
+
+        # parse version number from helm chart Chart.yaml file
+        $chartVersion=helm show chart ${{ parameters.chartName}}/ | grep ^version | cut -d' ' -f2
+        echo "*** Current version for ${{ parameters.chartName }} is $chartVersion"
+
+        # this splits the $chartVersion read from Chart.yaml into its components: major, minor, patch
+        $semVer=[System.Management.Automation.SemanticVersion]::Parse($chartVersion)   
+        
+        # this builds a semVer version with attached buildid <major>.<minor>.<patch>.build.<buildid>
+        $targetChartVersion=[System.Management.Automation.SemanticVersion]::New($($semVer.Major),$($semVer.Minor),$($semVer.Patch),"build",$(Build.BuildId))
+
+        # OCI artifact references (e.g. tags) do not support the plus sign (+).
+        $targetChartVersion=$targetChartVersion.replace("+","_")
+
+        # package helm chart in tar.gz format
+        echo "*** Package helm chart ${{ parameters.chartName }} with version $targetChartVersion"
+        helm package ${{ parameters.chartName }} --version $targetChartVersion
+
+        # push helm chart to the azure container registry
+        echo "*** Pushing helm chart ${{ parameters.chartName }} to ACR $(acr_name)"
+        helm push ${{ parameters.chartName }}-$targetChartVersion.tgz oci://$(acr_name).azurecr.io/helm
+
+        # Write image name to file so we can publish it
+        Set-Content -Value $targetChartVersion -Path "${{ parameters.jobName }}.txt"
+
+  - publish:  '${{ parameters.workingDirectory }}/${{ parameters.jobName }}.txt'
+    artifact: 'helmCharts-${{ parameters.jobName }}'
+    condition: succeeded()
+    displayName: 'Publish helm chart name'
