@@ -1,0 +1,7 @@
+// Query used to extract the region name to display it dynamically on the dashboard
+AzureMetrics
+| where TimeGenerated > ago(1h)
+| extend LocationString = extract("RESOURCEGROUPS/.+-STAMP-(.+)-RG/", 1, ResourceId)
+| where LocationString != ""
+| project LocationString = strcat(LocationString, " Stamp")
+| take 1
